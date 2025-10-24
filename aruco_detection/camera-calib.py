@@ -12,9 +12,10 @@ Key differences from C++:
 import cv2
 import numpy as np
 from cv2 import aruco
+import argparse
 
 def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_length, marker_length, 
-                           dictionary_id=aruco.DICT_6X6_250, calibration_flags=0, aspect_ratio=1.0):
+                           dictionary_id=aruco.DICT_4X4_50, calibration_flags=0, aspect_ratio=1.0):
     """
     Calibrate camera using ChArUco board detection
     
@@ -47,6 +48,12 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
     # Open video capture
     input_video = cv2.VideoCapture(input_video_path)
     
+    if not input_video.isOpened():
+        print(f"Error: Could not open video source {input_video_path}")
+        return None, None, None, None
+    
+    print(f"Video source opened successfully")
+    
     # Storage for calibration data
     all_charuco_corners = []
     all_charuco_ids = []
@@ -55,12 +62,18 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
     all_images = []
     image_size = None
     
-    print("Press 'c' to capture frame, 'q' to quit and proceed with calibration")
+    print("Auto mode: capturing every frame with a detected board. Press 'q' to stop (webcam) or let the video finish.")
     
+    frame_count = 0
     while True:
         ret, image = input_video.read()
         if not ret:
+            print(f"Failed to read frame or end of video reached (frame {frame_count})")
             break
+        
+        frame_count += 1
+        if frame_count % 30 == 0:  # Print every 30 frames
+            print(f"Processing frame {frame_count}...")
             
         image_copy = image.copy()
         
@@ -73,39 +86,43 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
         
         if charuco_corners is not None and len(charuco_corners) > 3:
             aruco.drawDetectedCornersCharuco(image_copy, charuco_corners, charuco_ids)
+            # Add status text when board is detected
+            cv2.putText(image_copy, f"Board detected (Auto capture)  Captured: {len(all_images)}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            cv2.putText(image_copy, f"No board detected  Captured: {len(all_images)}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
         # Display image
         cv2.imshow('ChArUco Detection', image_copy)
-        key = cv2.waitKey(1) & 0xFF
-        
-        # Capture frame when 'c' is pressed
-        if key == ord('c') and charuco_corners is not None and len(charuco_corners) > 3:
-            # Get object and image points from ChArUco detection
+        key = cv2.waitKey(1) & 0xFF  # keep UI responsive
+
+        # Auto-capture whenever a valid board is detected
+        if charuco_corners is not None and len(charuco_corners) > 3 and charuco_ids is not None:
             try:
-                # Get board object points for detected corners
                 chessboard_corners = board.getChessboardCorners()
                 object_points = np.array([chessboard_corners[int(id)] for id in charuco_ids.flatten()], dtype=np.float32)
                 image_points = charuco_corners.reshape(-1, 2).astype(np.float32)
-                
+
                 if len(image_points) == 0 or len(object_points) == 0:
-                    print("Point matching failed, try again.")
+                    # Skip if matching failed
                     continue
-                    
-                print(f"Frame captured with {len(image_points)} corner points")
-                
+
                 all_charuco_corners.append(charuco_corners)
                 all_charuco_ids.append(charuco_ids)
                 all_image_points.append(image_points)
                 all_object_points.append(object_points)
                 all_images.append(image.copy())
-                
+
                 if image_size is None:
                     image_size = (image.shape[1], image.shape[0])  # (width, height)
+
             except Exception as e:
-                print(f"Error processing frame: {e}")
+                # Skip frame on error
                 continue
-                
-        elif key == ord('q'):
+
+        # Allow user to stop early (useful for webcam)
+        if key == ord('q'):
             break
     
     input_video.release()
@@ -117,20 +134,24 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
     
     print(f"Calibrating camera with {len(all_image_points)} frames...")
     
-    # Initialize camera matrix
+
+    # Always initialize camera matrix as 3x3 identity
+    camera_matrix = np.eye(3, dtype=np.float64)
     if calibration_flags & cv2.CALIB_FIX_ASPECT_RATIO:
-        camera_matrix = np.eye(3, dtype=np.float64)
         camera_matrix[0, 0] = aspect_ratio
-    else:
-        camera_matrix = np.eye(3, dtype=np.float64)
-    
-    # Initialize distortion coefficients
-    dist_coeffs = np.zeros((4, 1))
-    
+
+    # Initialize distortion coefficients (1D, length 5 for most cameras)
+    dist_coeffs = np.zeros(5, dtype=np.float64)
+
+    # Ensure object/image points are lists of arrays with correct shape
+    obj_points = [np.array(pts, dtype=np.float32).reshape(-1, 3) for pts in all_object_points]
+    img_points = [np.array(pts, dtype=np.float32).reshape(-1, 2) for pts in all_image_points]
+
+    mat:cv2.typing.MatLike = None # type: ignore
     # Calibrate camera using standard calibrateCamera with ChArUco points
-    rep_error, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-        all_object_points, all_image_points, image_size, camera_matrix, dist_coeffs, flags=calibration_flags
-    )
+    rep_error, camera_matrix, dist_coeffs, _ , _ = cv2.calibrateCamera(
+        objectPoints=obj_points, imagePoints=img_points, imageSize=image_size, cameraMatrix=camera_matrix, distCoeffs=dist_coeffs  # type: ignore
+    ) # type: ignore
     
     print(f"Calibration completed!")
     print(f"Reprojection error: {rep_error}")
@@ -141,23 +162,33 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
 
 
 def main():
-    # Example usage
+    # CLI arguments
+    parser = argparse.ArgumentParser(description="ChArUco camera calibration")
+    parser.add_argument("--video", type=str, default='recordings/out.mp4', help="Path to input video file. If omitted, uses webcam.")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index to use when --video is not provided.")
+    parser.add_argument("--squares-x", type=int, default=11, help="Number of ChArUco squares in X direction.")
+    parser.add_argument("--squares-y", type=int, default=8, help="Number of ChArUco squares in Y direction.")
+    parser.add_argument("--square-length", type=float, default=0.017, help="Square side length in meters.")
+    parser.add_argument("--marker-length", type=float, default=0.012, help="Marker side length in meters.")
+    args = parser.parse_args()
+
     # Configure ChArUco board parameters
-    squares_x = 7  # Number of squares in X direction
-    squares_y = 5  # Number of squares in Y direction  
-    square_length = 0.04  # Length of square side in meters
-    marker_length = 0.032  # Length of marker side in meters
-    
+    squares_x = args.squares_x
+    squares_y = args.squares_y
+    square_length = args.square_length
+    marker_length = args.marker_length
+
     # Calibration parameters
     calibration_flags = 0  # Default flags
     # calibration_flags = cv2.CALIB_FIX_ASPECT_RATIO  # Example flag
-    
-    # Input video (can also use 0 for webcam)
-    input_video_path = 0  # Use webcam, or specify path to video file
-    
+
+    # Select source
+    input_source = args.video if args.video else args.camera
+    print(f"Using input source: {input_source}")
+
     # Perform calibration
     camera_matrix, dist_coeffs, rep_error, images = calibrate_camera_charuco(
-        input_video_path, squares_x, squares_y, square_length, marker_length, 
+        input_source, squares_x, squares_y, square_length, marker_length, 
         calibration_flags=calibration_flags
     )
     
