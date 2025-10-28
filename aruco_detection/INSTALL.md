@@ -5,7 +5,7 @@ Welcome! This guide will help you get started with the ArUco marker detection. B
 **Prerequisites:**
 - ROS2 Jazzy installed on Ubuntu
 - Basic terminal/command line familiarity
-- Webcam connected to your computer
+- Intel RealSense D435i camera (required)
 
 --- 
 
@@ -59,7 +59,7 @@ This project needs specific versions of OpenCV and NumPy to work with ROS2 Jazzy
 
 **Installation:**
 ```bash
-pip install opencv-contrib-python==4.8.1.78 numpy==1.26.4 --break-system-packages
+pip install opencv-contrib-python==4.8.1.78 numpy==1.26.4 pyrealsense2 --break-system-packages
 ```
 
 **Note on Virtual Environments:**
@@ -78,6 +78,40 @@ git clone https://github.com/rice-robotics-club/auto-nav-f2025.git
 # Navigate to the workspace
 cd auto-nav-f2025
 ```
+
+### Install Intel RealSense Support (Required)
+
+This project requires the Intel RealSense D435i camera. Follow these steps to install the necessary software:
+
+**Step 1: Install Intel RealSense SDK**
+
+Follow the official installation guide at: https://github.com/IntelRealSense/realsense-ros#installation-on-ubuntu
+
+Specifically, follow **Step 2, Option 1 (Linux Debian Installation)** from the guide.
+
+**Step 2: Install ROS2 RealSense Wrapper Packages**
+
+Install each package individually:
+
+```bash
+sudo apt install ros-jazzy-realsense2-dbsym
+sudo apt install ros-jazzy-realsense2-dbgsym
+sudo apt install ros-jazzy-realsense2-description
+sudo apt install ros-jazzy-realsense2-camera-dbgsym
+sudo apt install ros-jazzy-realsense2-camera-msgs-dbgsym
+sudo apt install ros-jazzy-realsense2-camera
+sudo apt install ros-jazzy-realsense2-camera-msgs
+```
+
+**Step 3: Verify Installation**
+
+Check that your RealSense camera is detected:
+
+```bash
+rs-enumerate-devices
+```
+
+You should see information about your connected D435i camera. If you get a "command not found" error, the SDK wasn't installed correctly. If no camera is detected, check your USB 3.0 connection.
 
 ---
 
@@ -174,16 +208,43 @@ Make sure it's at least 2-3 inches on screen/paper for best detection.
 
 ### Launch the Complete System
 
-**With RViz visualization (recommended for testing):**
+**With RealSense and RViz visualization (recommended for testing):**
 ```bash
 source install/setup.bash  # If you haven't already in this terminal
-ros2 launch aruco_detection aruco_detection.launch.py
+ros2 launch aruco_detection aruco_detection.launch.py camera_type:=realsense stream_type:=color
 ```
 
 **Without RViz (for headless robot deployment):**
 ```bash
-ros2 launch aruco_detection aruco_detection.launch.py use_rviz:=false
+ros2 launch aruco_detection aruco_detection.launch.py camera_type:=realsense stream_type:=color use_rviz:=false
 ```
+
+**Available Launch Arguments:**
+
+You can customize the launch with these arguments:
+
+- `camera_type`: Camera source to use
+  - `webcam` - Use laptop/USB webcam (default, for testing only)
+    - calibration needs to be done for webcam, and currently `webcam_publisher.py` doesn't utilize calibrated data from `camera-calib.py` or the generated `camera_calibration.npz` file
+  - `realsense` - Use Intel RealSense D435i (recommended, no extra calibration with `camera-calib.py` needed)
+
+- `stream_type`: For RealSense, which stream to use
+  - `color` - RGB color stream (default, recommended for ArUco detection)
+  - `depth` - Depth stream (grayscale distance data)
+  - `infra1` - Left infrared camera
+  - `infra2` - Right infrared camera
+
+- `use_rviz`: Show RViz 3D visualization
+  - `true` - Show RViz (default)
+  - `false` - No visualization (headless mode)
+
+**Example with multiple arguments:**
+```bash
+# RealSense with depth stream and no RViz
+ros2 launch aruco_detection aruco_detection.launch.py camera_type:=realsense stream_type:=depth use_rviz:=false
+```
+
+**Note:** Always use `stream_type:=color` for ArUco marker detection. The other streams are provided for other use cases (not currently used).
 
 ### What You Should See
 
@@ -225,22 +286,75 @@ ROS2 uses **topics** for communication between different parts of your robot sof
 - Other nodes **tune in** (subscribe) to receive that data
 - Many nodes can publish or subscribe to the same topic
 
+### System Architecture
+
+Here's how the different components connect in Intel RealSense mode:
+
+```mermaid
+flowchart LR
+    Camera[RealSense D435i<br/>Hardware]
+    RS[realsense2_camera<br/>node]
+    RSP[realsense_publisher<br/>node]
+    Aruco[aruco_node]
+    RViz[rviz2]
+
+    Camera -->|USB 3.0| RS
+    RS -->|/camera/realsense2_camera/<br/>color/image_raw<br/>RGB8| RSP
+    RS -->|/camera/realsense2_camera/<br/>color/camera_info| RSP
+    RSP -->|/image_raw<br/>BGR8 converted| Aruco
+    RSP -->|/camera_info| Aruco
+    Aruco -->|/aruco_poses| RViz
+    Aruco -->|/aruco_markers| RViz
+    Aruco -->|/aruco_detection/image| Display[OpenCV Window]
+```
+
+**How it works:**
+
+1. **RealSense camera** connects via USB 3.0 and is managed by the `realsense2_camera` driver node
+2. **realsense2_camera node** publishes raw RGB images and factory calibration data
+3. **realsense_publisher node** (our custom bridge):
+   - Subscribes to RealSense topics
+   - Converts RGB images to BGR format (required by OpenCV/ArUco)
+   - Republishes to standardized topic names that `aruco_node` expects
+4. **aruco_node** processes images and publishes marker detections
+5. **RViz and OpenCV** display the results
+
+This architecture allows us to use different cameras (webcam or RealSense) while keeping the ArUco detection code unchanged.
+
 ### Key Topics in This System
 
-**What `aruco_node` publishes (sends out):**
+#### Camera Input Topics
+
+These topics provide camera data to the system:
+
+**RealSense Mode Topics:**
+
+| Topic | Publisher | Type | Description |
+|-------|-----------|------|-------------|
+| `/camera/realsense2_camera/color/image_raw` | `realsense2_camera` | `sensor_msgs/Image` | Raw RGB8 images from RealSense camera |
+| `/camera/realsense2_camera/color/camera_info` | `realsense2_camera` | `sensor_msgs/CameraInfo` | Factory calibration from RealSense |
+| `/camera/realsense2_camera/depth/image_rect_raw` | `realsense2_camera` | `sensor_msgs/Image` | Depth data (distance measurements) |
+| `/image_raw` | `realsense_publisher` | `sensor_msgs/Image` | RGB→BGR converted images for ArUco |
+| `/camera_info` | `realsense_publisher` | `sensor_msgs/CameraInfo` | Remapped calibration data |
+
+**Note:** The `realsense_publisher` node acts as a bridge, converting and remapping RealSense topics to the standardized `/image_raw` and `/camera_info` that `aruco_node` expects.
+
+**Webcam Mode Topics:**
+
+| Topic | Publisher | Type | Description |
+|-------|-----------|------|-------------|
+| `/image_raw` | `webcam_publisher` | `sensor_msgs/Image` | BGR8 images directly from webcam |
+| `/camera_info` | `webcam_publisher` | `sensor_msgs/CameraInfo` | Approximate calibration (estimated) |
+
+#### ArUco Detection Output Topics
+
+These topics are published by `aruco_node` with marker detection results:
 
 | Topic | Type | Description |
 |-------|------|-------------|
 | `/aruco_poses` | `geometry_msgs/PoseArray` | 3D positions and orientations for RViz visualization |
-| `/aruco_markers` | `aruco_detection_interfaces/ArucoMarkers` | Marker IDs paired with their poses (most useful!) |
-| `/aruco_detection/image` | `sensor_msgs/Image` | Camera feed with markers and axes drawn on it |
-
-**What `aruco_node` subscribes to (listens for):**
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/image_raw` | `sensor_msgs/Image` | Raw webcam images from camera |
-| `/camera_info` | `sensor_msgs/CameraInfo` | Camera calibration data |
+| `/aruco_markers` | `aruco_detection_interfaces/ArucoMarkers` | Marker IDs paired with their poses (most useful for robot control!) |
+| `/aruco_detection/image` | `sensor_msgs/Image` | Camera feed with detected markers and 3D axes overlaid |
 
 ### Useful Debug Commands
 
@@ -268,6 +382,22 @@ ros2 node list
 
 # Get info about the aruco_node
 ros2 node info /aruco_node
+
+# RealSense-specific commands:
+# See all RealSense camera topics
+ros2 topic list | grep realsense2_camera
+
+# Check RealSense camera node details
+ros2 node info /camera/realsense2_camera
+
+# Inspect the realsense_publisher bridge node
+ros2 node info /realsense_publisher
+
+# Verify image is flowing from RealSense
+ros2 topic hz /camera/realsense2_camera/color/image_raw
+
+# Verify converted image is flowing to aruco_node
+ros2 topic hz /image_raw
 ```
 
 ---
@@ -287,7 +417,7 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
 # 3. Launch the system
-ros2 launch aruco_detection aruco_detection.launch.py
+ros2 launch aruco_detection aruco_detection.launch.py camera_type:=realsense stream_type:=color
 ```
 
 ### Common Issues & Solutions
@@ -301,6 +431,8 @@ ros2 launch aruco_detection aruco_detection.launch.py
 | **RViz shows gray screen** | • Check topics are publishing: `ros2 topic list`<br>• Verify Fixed Frame is set to `map` in RViz |
 | **OpenCV window doesn't show** | Normal on headless systems, use RViz instead |
 | **Build errors after pulling new code** | Clean rebuild: `rm -rf build install log && colcon build` |
+| **RealSense camera not detected** | • Check USB 3.0 connection (blue USB port)<br>• Verify installation: `rs-enumerate-devices`<br>• Try different USB port<br>• Ensure RealSense SDK installed correctly |
+| **No camera topics publishing** | • Verify ROS packages: `dpkg -l \| grep realsense2-camera`<br>• Check nodes running: `ros2 node list`<br>• Review launch terminal for errors |
 
 ### Keyboard Shortcuts
 
