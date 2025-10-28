@@ -14,15 +14,79 @@ import numpy as np
 from cv2 import aruco
 import argparse
 
-def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_length, marker_length, 
+try:
+    import pyrealsense2 as rs
+    REALSENSE_AVAILABLE = True
+except ImportError:
+    REALSENSE_AVAILABLE = False
+
+
+class RealSenseCapture:
+    """
+    Wrapper for Intel RealSense camera that mimics cv2.VideoCapture interface.
+    Ensures we get the color stream (RGB), not infrared.
+    """
+    def __init__(self, width=640, height=480, fps=30):
+        if not REALSENSE_AVAILABLE:
+            raise ImportError("pyrealsense2 is not installed. Install with: pip install pyrealsense2")
+
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+
+        # Configure color stream
+        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+
+        # Start pipeline
+        try:
+            self.pipeline.start(self.config)
+            self._is_opened = True
+            print(f"RealSense camera opened: {width}x{height} @ {fps}fps (Color stream)")
+        except Exception as e:
+            print(f"Failed to start RealSense pipeline: {e}")
+            self._is_opened = False
+
+    def isOpened(self):
+        """Check if camera is opened"""
+        return self._is_opened
+
+    def read(self):
+        """Read a frame from the camera. Returns (ret, frame) like cv2.VideoCapture"""
+        if not self._is_opened:
+            return False, None
+
+        try:
+            # Wait for frames
+            frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+            color_frame = frames.get_color_frame()
+
+            if not color_frame:
+                return False, None
+
+            # Convert to numpy array (already in BGR8 format)
+            frame = np.asanyarray(color_frame.get_data())
+            return True, frame
+
+        except Exception as e:
+            print(f"Error reading frame: {e}")
+            return False, None
+
+    def release(self):
+        """Release the camera"""
+        if self._is_opened:
+            self.pipeline.stop()
+            self._is_opened = False
+            print("RealSense camera released")
+
+
+def calibrate_camera_charuco(capture, squares_x, squares_y, square_length, marker_length,
                            dictionary_id=aruco.DICT_4X4_50, calibration_flags=0, aspect_ratio=1.0):
     """
     Calibrate camera using ChArUco board detection
     
     Args:
-        input_video_path: Path to input video file or camera index
+        capture: cv2.VideoCapture or RealSenseCapture object (already opened)
         squares_x: Number of squares in X direction
-        squares_y: Number of squares in Y direction  
+        squares_y: Number of squares in Y direction
         square_length: Length of square side (in meters or preferred unit)
         marker_length: Length of marker side (in same unit as square_length)
         dictionary_id: ArUco dictionary to use
@@ -44,16 +108,14 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
     detector_params = aruco.DetectorParameters()
     charuco_params = aruco.CharucoParameters()
     detector = aruco.CharucoDetector(board, charuco_params, detector_params)
-    
-    # Open video capture
-    input_video = cv2.VideoCapture(input_video_path)
-    
-    if not input_video.isOpened():
-        print(f"Error: Could not open video source {input_video_path}")
+
+    # Check if capture is opened
+    if not capture.isOpened():
+        print(f"Error: Could not open capture device")
         return None, None, None, None
-    
-    print(f"Video source opened successfully")
-    
+
+    print(f"Capture device opened successfully")
+
     # Storage for calibration data
     all_charuco_corners = []
     all_charuco_ids = []
@@ -66,7 +128,7 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
     
     frame_count = 0
     while True:
-        ret, image = input_video.read()
+        ret, image = capture.read()
         if not ret:
             print(f"Failed to read frame or end of video reached (frame {frame_count})")
             break
@@ -124,8 +186,8 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
         # Allow user to stop early (useful for webcam)
         if key == ord('q'):
             break
-    
-    input_video.release()
+        
+    capture.release()
     cv2.destroyAllWindows()
     
     if len(all_image_points) == 0 or image_size is None:
@@ -164,12 +226,13 @@ def calibrate_camera_charuco(input_video_path, squares_x, squares_y, square_leng
 def main():
     # CLI arguments
     parser = argparse.ArgumentParser(description="ChArUco camera calibration")
-    parser.add_argument("--video", type=str, default='recordings/out.mp4', help="Path to input video file. If omitted, uses webcam.")
+    parser.add_argument("--video", type=str, default='', help="Path to input video file. If omitted, uses webcam.")
     parser.add_argument("--camera", type=int, default=0, help="Webcam index to use when --video is not provided.")
+    parser.add_argument("--realsense", action='store_true', help="Use Intel RealSense camera (color stream).")
     parser.add_argument("--squares-x", type=int, default=11, help="Number of ChArUco squares in X direction.")
     parser.add_argument("--squares-y", type=int, default=8, help="Number of ChArUco squares in Y direction.")
-    parser.add_argument("--square-length", type=float, default=0.017, help="Square side length in meters.")
-    parser.add_argument("--marker-length", type=float, default=0.012, help="Marker side length in meters.")
+    parser.add_argument("--square-length", type=float, default=0.023, help="Square side length in meters.")
+    parser.add_argument("--marker-length", type=float, default=0.017, help="Marker side length in meters.")
     args = parser.parse_args()
 
     # Configure ChArUco board parameters
@@ -182,13 +245,22 @@ def main():
     calibration_flags = 0  # Default flags
     # calibration_flags = cv2.CALIB_FIX_ASPECT_RATIO  # Example flag
 
-    # Select source
-    input_source = args.video if args.video else args.camera
-    print(f"Using input source: {input_source}")
+    # Create capture device based on flags
+    if args.realsense:
+        if not REALSENSE_AVAILABLE:
+            print("Error: pyrealsense2 is not installed. Install with: pip install pyrealsense2")
+            return
+        print("Using Intel RealSense camera (color stream)")
+        capture = RealSenseCapture()
+    else:
+        # Select source (video file or webcam)
+        input_source = args.video if args.video else args.camera
+        print(f"Using input source: {input_source}")
+        capture = cv2.VideoCapture(input_source)
 
     # Perform calibration
     camera_matrix, dist_coeffs, rep_error, images = calibrate_camera_charuco(
-        input_source, squares_x, squares_y, square_length, marker_length, 
+        capture, squares_x, squares_y, square_length, marker_length,
         calibration_flags=calibration_flags
     )
     
