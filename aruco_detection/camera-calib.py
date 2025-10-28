@@ -146,28 +146,44 @@ def calibrate_camera_charuco(capture, squares_x, squares_y, square_length, marke
         if marker_ids is not None:
             aruco.drawDetectedMarkers(image_copy, marker_corners, marker_ids)
         
-        if charuco_corners is not None and len(charuco_corners) > 3:
+        if charuco_corners is not None and len(charuco_corners) >= 6:
             aruco.drawDetectedCornersCharuco(image_copy, charuco_corners, charuco_ids)
             # Add status text when board is detected
-            cv2.putText(image_copy, f"Board detected (Auto capture)  Captured: {len(all_images)}", (10, 30), 
+            cv2.putText(image_copy, f"Board detected (Auto capture)  Captured: {len(all_images)}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:
-            cv2.putText(image_copy, f"No board detected  Captured: {len(all_images)}", (10, 30), 
+            cv2.putText(image_copy, f"No board detected  Captured: {len(all_images)}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
+
         # Display image
         cv2.imshow('ChArUco Detection', image_copy)
         key = cv2.waitKey(1) & 0xFF  # keep UI responsive
 
-        # Auto-capture whenever a valid board is detected
-        if charuco_corners is not None and len(charuco_corners) > 3 and charuco_ids is not None:
+        # Auto-capture whenever a valid board is detected (need at least 6 corners for DLT algorithm)
+        if charuco_corners is not None and len(charuco_corners) >= 6 and charuco_ids is not None:
             try:
                 chessboard_corners = board.getChessboardCorners()
-                object_points = np.array([chessboard_corners[int(id)] for id in charuco_ids.flatten()], dtype=np.float32)
+
+                # Extract object points - handle potential shape issues
+                # chessboard_corners may be (N, 3) or (N, 1, 3)
+                obj_pts = []
+                for id in charuco_ids.flatten():
+                    pt = chessboard_corners[int(id)]
+                    # Flatten to ensure it's a 1D array of 3 elements
+                    pt_flat = pt.flatten()
+                    if len(pt_flat) == 3:
+                        obj_pts.append(pt_flat)
+
+                if len(obj_pts) < 6:
+                    continue
+
+                object_points = np.array(obj_pts, dtype=np.float32)
                 image_points = charuco_corners.reshape(-1, 2).astype(np.float32)
 
-                if len(image_points) == 0 or len(object_points) == 0:
-                    # Skip if matching failed
+                # Validate shapes
+                if object_points.shape != (len(charuco_ids), 3):
+                    continue
+                if image_points.shape != (len(charuco_ids), 2):
                     continue
 
                 all_charuco_corners.append(charuco_corners)
@@ -180,7 +196,9 @@ def calibrate_camera_charuco(capture, squares_x, squares_y, square_length, marke
                     image_size = (image.shape[1], image.shape[0])  # (width, height)
 
             except Exception as e:
-                # Skip frame on error
+                # Skip frame on error with debug info for first few frames
+                if frame_count <= 30:
+                    print(f"Warning: Skipping frame {frame_count}: {e}")
                 continue
 
         # Allow user to stop early (useful for webcam)
@@ -189,37 +207,29 @@ def calibrate_camera_charuco(capture, squares_x, squares_y, square_length, marke
         
     capture.release()
     cv2.destroyAllWindows()
-    
-    if len(all_image_points) == 0 or image_size is None:
+
+    if len(all_charuco_corners) == 0 or image_size is None:
         print("No frames captured for calibration or image size not determined!")
         return None, None, None, None
-    
-    print(f"Calibrating camera with {len(all_image_points)} frames...")
-    
 
-    # Always initialize camera matrix as 3x3 identity
-    camera_matrix = np.eye(3, dtype=np.float64)
-    if calibration_flags & cv2.CALIB_FIX_ASPECT_RATIO:
-        camera_matrix[0, 0] = aspect_ratio
+    print(f"Calibrating camera with {len(all_charuco_corners)} frames...")
 
-    # Initialize distortion coefficients (1D, length 5 for most cameras)
-    dist_coeffs = np.zeros(5, dtype=np.float64)
+    # point matching and geometry done internally
+    rep_error, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+        charucoCorners=all_charuco_corners,
+        charucoIds=all_charuco_ids,
+        board=board,
+        imageSize=image_size,
+        cameraMatrix=None,
+        distCoeffs=None,
+        flags=calibration_flags
+    )
 
-    # Ensure object/image points are lists of arrays with correct shape
-    obj_points = [np.array(pts, dtype=np.float32).reshape(-1, 3) for pts in all_object_points]
-    img_points = [np.array(pts, dtype=np.float32).reshape(-1, 2) for pts in all_image_points]
-
-    mat:cv2.typing.MatLike = None # type: ignore
-    # Calibrate camera using standard calibrateCamera with ChArUco points
-    rep_error, camera_matrix, dist_coeffs, _ , _ = cv2.calibrateCamera(
-        objectPoints=obj_points, imagePoints=img_points, imageSize=image_size, cameraMatrix=camera_matrix, distCoeffs=dist_coeffs  # type: ignore
-    ) # type: ignore
-    
     print(f"Calibration completed!")
     print(f"Reprojection error: {rep_error}")
     print(f"Camera matrix:\n{camera_matrix}")
     print(f"Distortion coefficients: {dist_coeffs.ravel()}")
-    
+
     return camera_matrix, dist_coeffs, rep_error, all_images
 
 
